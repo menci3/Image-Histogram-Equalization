@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 #include <cuda_runtime.h>
 #include <cuda.h>
@@ -32,9 +33,9 @@ __global__ void copy_image(const unsigned char *imageIn, unsigned char *imageOut
 
 // RGB to YUV conversion device function
 __device__ void rgb_to_yuv_cuda(int R, int G, int B, int *Y, int *U, int *V) {
-    *Y = (int)(0.299 * R + 0.587 * G + 0.114 * B);
-    *U = (int)(-0.168736 * R - 0.331264 * G + 0.5 * B) + 128;
-    *V = (int)(0.5 * R - 0.418688 * G - 0.081312 * B) + 128;
+    *Y = (int)roundf(0.299f * R + 0.587f * G + 0.114f * B);
+    *U = (int)roundf(-0.168736f * R - 0.331264f * G + 0.5f * B) + 128;
+    *V = (int)roundf(0.5f * R - 0.418688f * G - 0.081312f * B) + 128;
 }
 
 // CUDA kernel for RGB to YUV conversion
@@ -67,21 +68,22 @@ __global__ void rgbToYuvKernel(const unsigned char *image_in, unsigned char *ima
 __global__ void computeHistogramKernel(const unsigned char *image, int *histogram, int width, int height) {
     __shared__ int partial_histogram[256];
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
     int threadId = threadIdx.x;
+    int globalId = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
 
     // Initialize shared memory
     for (int i = threadId; i < 256; i += blockDim.x) {
         partial_histogram[i] = 0;
     }
-
     __syncthreads();
 
-    // Strided access through the image
-    for (int i = idx; i < width * height; i += stride) {
-        int luminance = image[i * 3]; // Assuming input is RGB or YUV and Y is at index 0
-        atomicAdd(&partial_histogram[luminance], 1);
+    int numPixels = width * height;
+
+    for (int i = globalId; i < numPixels; i += stride) {
+        unsigned char y_value = image[i * 3];
+
+        atomicAdd(&partial_histogram[y_value], 1);
     }
     __syncthreads();
 
@@ -90,6 +92,19 @@ __global__ void computeHistogramKernel(const unsigned char *image, int *histogra
         atomicAdd(&histogram[i], partial_histogram[i]);
     }
 }
+
+__global__ void computeHistogramKernelSimple(const unsigned char *image, int *histogram, int width, int height) {
+    int globalId = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    int numPixels = width * height;
+
+    for (int i = globalId; i < numPixels; i += stride) {
+        unsigned char y_value = image[i * 3];
+        atomicAdd(&histogram[y_value], 1);
+    }
+}
+
 
 __global__ void computeCumulativeHistogram(int *histogram, int *cdf) {
    extern __shared__ int temp[256]; // 256 entries, 1 block
@@ -134,7 +149,7 @@ __global__ void computeCumulativeHistogram(int *histogram, int *cdf) {
     }
 
     __syncthreads();
-    
+
     // Write result to output CDF (inclusive scan)
     if (tid < 256) {
         // For inclusive scan: add the original value to the exclusive scan result
@@ -142,23 +157,33 @@ __global__ void computeCumulativeHistogram(int *histogram, int *cdf) {
     }
 }
 
+__global__ void computeCumulativeHistogramSimple(const int *histogram, int *cdf) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        int sum = 0;
+        for (int i = 0; i < 256; ++i) {
+            sum += histogram[i];
+            cdf[i] = sum;
+        }
+    }
+}
+
 __global__ void calculateLuminanceLookupKernel(int *histogram_cumulative, int *luminance_lookup_table, int pixels) {
     __shared__ int min_value;
-    
+
     int tid = threadIdx.x;
-    
+
     // Initialize min_value to INT_MAX
     if (tid == 0) {
         min_value = INT_MAX;
     }
     __syncthreads();
-    
+
     // Each thread checks its value
     if (tid < 256 && histogram_cumulative[tid] > 0 && histogram_cumulative[tid] < min_value) {
         atomicMin(&min_value, histogram_cumulative[tid]);
     }
     __syncthreads();
-    
+
     // Calculate new luminance values
     if (tid < 256) {
         // Apply histogram equalization formula
@@ -169,33 +194,37 @@ __global__ void calculateLuminanceLookupKernel(int *histogram_cumulative, int *l
 __global__ void applyLuminanceAndConvertToRgbKernel(unsigned char *image, const int *luminance_lookup_table, int width, int height) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     int row = blockIdx.y * blockDim.y + threadIdx.y;
-    
+
     if (row < height && col < width) {
         int index = (row * width + col) * 3;
-        
+
         // Get YUV values
         int Y = image[index];
         int U = image[index + 1];
         int V = image[index + 2];
-        
+
         // Apply new luminance from lookup table
         Y = luminance_lookup_table[Y];
-        
+
         // Convert back to RGB
         int R, G, B;
         U -= 128;
         V -= 128;
-        
+
         // YUV to RGB conversion with correct coefficients
-        R = Y + 1.402 * V;
-        G = Y - 0.344136 * U - 0.714136 * V;
-        B = Y + 1.772 * U;
-        
+        R = (int)roundf(Y + 1.402f * V);
+        G = (int)roundf(Y - 0.344136f * U - 0.714136f * V);
+        B = (int)roundf(Y + 1.772f * U);
+
         // Clamp values to [0, 255]
-        R = max(0, min(255, R));
-        G = max(0, min(255, G));
-        B = max(0, min(255, B));
-        
+        //R = max(0, min(255, R));
+        //G = max(0, min(255, G));
+        //B = max(0, min(255, B));
+
+        R = R < 0 ? 0 : (R > 255 ? 255 : R);
+        G = G < 0 ? 0 : (G > 255 ? 255 : G);
+        B = B < 0 ? 0 : (B > 255 ? 255 : B);
+
         // Store RGB values
         image[index] = R;
         image[index + 1] = G;
@@ -204,18 +233,18 @@ __global__ void applyLuminanceAndConvertToRgbKernel(unsigned char *image, const 
 }
 
 void rgb_to_yuv(int R, int G, int B, int *Y, int *U, int *V) {
-    *Y = (0.299 * R + 0.587 * G + 0.114 * B);
-    *U = (-0.168736 * R - 0.331264 * G + 0.5 * B) + 128;
-    *V = (0.5 * R - 0.418688 * G - 0.081312 * B) + 128;
+    *Y = (int)roundf(0.299f * R + 0.587f * G + 0.114f * B);
+    *U = (int)roundf(-0.168736f * R - 0.331264f * G + 0.5f * B) + 128;
+    *V = (int)roundf(0.5f * R - 0.418688f * G - 0.081312f * B) + 128;
 }
 
 void yuv_to_rgb(int Y, int U, int V, int *R, int *G, int *B) {
     U -= 128;
     V -= 128;
 
-    *R = (Y + 1.402 * V);
-    *G = (Y - 0.344136 * U - 0.714136 * V);
-    *B = (Y + 1.772 * U);
+    *R = (int)roundf(Y + 1.402f * V);
+    *G = (int)roundf(Y - 0.344136f * U - 0.714136f * V);
+    *B = (int)roundf(Y + 1.772f * U);
 
     // Ensuring that the values stay in range [0,255]
     *R = *R < 0 ? 0 : (*R > 255 ? 255 : *R);
@@ -224,6 +253,7 @@ void yuv_to_rgb(int Y, int U, int V, int *R, int *G, int *B) {
 }
 
 void sequential(const unsigned char *image_in, unsigned char *image_out, int width, int height) {
+    printf("Sequential execution time\n");
     // 1. Transform the image from RGB to YUV space
     for (int i = 0; i < height; i++){
         for (int j = 0; j < width; j++){
@@ -246,23 +276,25 @@ void sequential(const unsigned char *image_in, unsigned char *image_out, int wid
 
     // 2. Compute the luminance histogram
     int histogram[256] = {0};
+    int y_value;
 
     for (int i = 0; i < height; i++){
         for (int j = 0; j < width; j++){
             int index = (i * width + j) * 3;
 
-            histogram[image_out[index]]++;
+            y_value = image_out[index];
+            histogram[y_value]++;
         }
-    }    
+    }
 
     // 3. Calculate the cumulative histogram
     int histogram_cumulative[256] = {0};
 
     histogram_cumulative[0] = histogram[0];
-    
+
     for (int i = 1; i < 256; i++){
         histogram_cumulative[i] = histogram_cumulative[i - 1] + histogram[i];
-    }    
+    }
 
     // 4. Calculate new pixel luminances from original luminances based on the histogram equalization formula
     int luminance[256] = {0};
@@ -289,7 +321,7 @@ void sequential(const unsigned char *image_in, unsigned char *image_out, int wid
 
             image_out[index] = luminance[image_out[index]];
         }
-    }    
+    }
 
     // 6. Convert the image back to RGB colour space
     for (int i = 0; i < height; i++){
@@ -312,12 +344,12 @@ void sequential(const unsigned char *image_in, unsigned char *image_out, int wid
     }
 }
 
-void parallel(unsigned char *image_in, unsigned char *image_out, int width, int height) {
+void parallel(unsigned char *image_in, unsigned char *image_out, int width, int height, int blockSizeInput) {
     cudaError_t error;
     int imageSize = width * height * 3 * sizeof(unsigned char);
 
     // Set up execution configuration
-    dim3 blockSize(16, 16);
+    dim3 blockSize(blockSizeInput, blockSizeInput);
     dim3 gridSize((width + blockSize.x - 1) / blockSize.x, (height + blockSize.y - 1) / blockSize.y);
 
     int histogramThreads = 256;
@@ -340,7 +372,7 @@ void parallel(unsigned char *image_in, unsigned char *image_out, int width, int 
 
     // Copy input image to device
     cudaMemcpy(d_image_in, image_in, imageSize, cudaMemcpyHostToDevice);
-    
+
     int *d_histogram;
     int* d_cdf;
     int *d_luminance_lookup_table;
@@ -351,8 +383,34 @@ void parallel(unsigned char *image_in, unsigned char *image_out, int width, int 
     cudaMemset(d_histogram, 0, 256 * sizeof(int));
 
     // Launch RGB to YUV conversion kernel
+    // Run once to warm up the GPU and not invalidate the measurement
     rgbToYuvKernel<<<gridSize, blockSize>>>(d_image_in, d_image_out, width, height);
-    
+
+    /*cudaEvent_t start, stop;
+    float milliseconds = 0;
+    float total_milliseconds = 0;
+    int iterations = 10;
+
+    for (int i = 0; i < iterations; i++) {
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+
+        cudaEventRecord(start);
+
+        rgbToYuvKernel<<<gridSize, blockSize>>>(d_image_in, d_image_out, width, height);
+
+        cudaEventRecord(stop);
+
+        cudaEventSynchronize(stop);
+
+        // Print time
+        cudaEventElapsedTime(&milliseconds, start, stop);
+        total_milliseconds += milliseconds;
+    }
+
+    printf("RGBtoYUV Block size %i, time: %0.3f milliseconds \n", blockSizeInput * blockSizeInput, total_milliseconds/iterations);
+    total_milliseconds = 0; */
+
     // Check for kernel launch errors
     error = cudaGetLastError();
     if (error != cudaSuccess) {
@@ -361,17 +419,41 @@ void parallel(unsigned char *image_in, unsigned char *image_out, int width, int 
         cudaFree(image_out);
         return;
     }
-    
+
     // Make sure kernel execution is finished
     cudaDeviceSynchronize();
-    
+
     // TODO: Add the remaining steps of histogram equalization
     // 1. Compute luminance histogram
-    computeHistogramKernel<<<histogramBlocks, histogramThreads>>>(d_image_out, d_histogram, width, height);
+
+    /*for (int i = 0; i < iterations; i++) {
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+
+        cudaEventRecord(start);
+
+        computeHistogramKernelSimple<<<histogramBlocks, histogramThreads>>>(d_image_out, d_histogram, width, height);
+        cudaDeviceSynchronize();
+
+        cudaEventRecord(stop);
+
+        cudaEventSynchronize(stop);
+
+        // Print time
+        cudaEventElapsedTime(&milliseconds, start, stop);
+        total_milliseconds += milliseconds;
+    }
+
+    printf("histogram Block size %i, time: %0.3f milliseconds \n", blockSizeInput * blockSizeInput, total_milliseconds/iterations);
+    total_milliseconds = 0; */
+
+
+    computeHistogramKernelSimple<<<histogramBlocks, histogramThreads>>>(d_image_out, d_histogram, width, height);
     cudaDeviceSynchronize();
 
     // 2. Calculate cumulative histogram (Bleloch scan)
-    computeCumulativeHistogram<<<1, 256>>>(d_histogram, d_cdf);
+    //computeCumulativeHistogram<<<1, 256>>>(d_histogram, d_cdf);
+    computeCumulativeHistogramSimple<<<1, 1>>>(d_histogram, d_cdf);
     cudaDeviceSynchronize();
 
     // 3. Calculate new pixel luminances
@@ -380,9 +462,30 @@ void parallel(unsigned char *image_in, unsigned char *image_out, int width, int 
 
     // 4. Apply new luminance to each pixel
     // 5. Convert back from YUV to RGB
+
+    /*for (int i = 0; i < iterations; i++) {
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+
+        cudaEventRecord(start);
+
+        applyLuminanceAndConvertToRgbKernel<<<gridSize, blockSize>>>(d_image_out, d_luminance_lookup_table, width, height);
+        cudaDeviceSynchronize();
+
+        cudaEventRecord(stop);
+
+        cudaEventSynchronize(stop);
+
+        // Print time
+        cudaEventElapsedTime(&milliseconds, start, stop);
+        total_milliseconds += milliseconds;
+    }
+
+    printf("YUVtoRGB Block size %i, time: %0.3f milliseconds \n", blockSizeInput * blockSizeInput, total_milliseconds/iterations);*/
+
     applyLuminanceAndConvertToRgbKernel<<<gridSize, blockSize>>>(d_image_out, d_luminance_lookup_table, width, height);
     cudaDeviceSynchronize();
-    
+
     // Copy result back to host
     error = cudaMemcpy(image_out, d_image_out, imageSize, cudaMemcpyDeviceToHost);
     if (error != cudaSuccess) {
@@ -421,8 +524,18 @@ int main(int argc, char *argv[]) {
     const size_t datasize = width * height * cpp * sizeof(unsigned char);
     unsigned char *h_imageOut = (unsigned char *)malloc(datasize);
 
-    
-    //sequential(h_imageIn, h_imageOut, width, height);
+    /*clock_t begin, end;
+    float elapsed_ms;
+
+    begin = clock();
+
+    sequential(h_imageIn, h_imageOut, width, height);
+
+    end = clock();
+    elapsed_ms = ((float)(end - begin) / CLOCKS_PER_SEC) * 1000.0;
+
+    printf("Sequential method time: %.3f milliseconds\n", elapsed_ms);
+    */
 
     // Setup Thread organization
     //dim3 blockSize(16, 16);
@@ -436,25 +549,35 @@ int main(int argc, char *argv[]) {
     checkCudaErrors(cudaMalloc(&d_imageIn, datasize));
     checkCudaErrors(cudaMalloc(&d_imageOut, datasize));
 
-    // Use CUDA events to measure execution time
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    
-    cudaEventCreate(&stop);
-
-    cudaEventRecord(start);
-
     // Parallel CUDA implementation
-    parallel(h_imageIn, h_imageOut, width, height);
+    printf("Parallel execution time\n");
 
-    cudaEventRecord(stop);
-
-    cudaEventSynchronize(stop);
-
-    // Print time
+    cudaEvent_t start, stop;
     float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("Kernel Execution time is: %0.3f milliseconds \n", milliseconds);
+    float total_milliseconds = 0;
+    int iterations = 100;
+
+    for (int block = 8; block <= 32; block *= 2) {
+        printf("Block size %i\n", block * block);
+        for (int i = 0; i < iterations; i++) {
+            cudaEventCreate(&start);
+            cudaEventCreate(&stop);
+
+            cudaEventRecord(start);
+
+            parallel(h_imageIn, h_imageOut, width, height, block);
+
+            cudaEventRecord(stop);
+            cudaEventSynchronize(stop);
+
+            // Print time
+            cudaEventElapsedTime(&milliseconds, start, stop);
+            total_milliseconds += milliseconds;
+        }
+
+        printf("Block size %i, time: %0.3f milliseconds \n", block * block, total_milliseconds/iterations);
+        total_milliseconds = 0;
+    }
 
     // Write the output file
     char szImage_out_name_temp[255];
