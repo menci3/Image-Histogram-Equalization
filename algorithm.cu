@@ -10,6 +10,7 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image.h"
 #include "stb_image_write.h"
+#include <cfloat>
 
 #define COLOR_CHANNELS 0
 
@@ -40,13 +41,11 @@ __device__ void rgb_to_yuv_cuda(int R, int G, int B, int *Y, int *U, int *V) {
 
 // CUDA kernel for RGB to YUV conversion
 __global__ void rgbToYuvKernel(const unsigned char *image_in, unsigned char *image_out, int width, int height) {
-    // Calculate pixel position based on thread and block indices
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     
     // Check if the thread corresponds to a valid pixel
     if (row < height && col < width) {
-        // Calculate index in the 1D array
         int index = (row * width + col) * 3;
         
         // Get RGB values
@@ -65,34 +64,6 @@ __global__ void rgbToYuvKernel(const unsigned char *image_in, unsigned char *ima
     }
 }
 
-__global__ void computeHistogramKernel(const unsigned char *image, int *histogram, int width, int height) {
-    __shared__ int partial_histogram[256];
-
-    int threadId = threadIdx.x;
-    int globalId = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
-
-    // Initialize shared memory
-    for (int i = threadId; i < 256; i += blockDim.x) {
-        partial_histogram[i] = 0;
-    }
-    __syncthreads();
-
-    int numPixels = width * height;
-
-    for (int i = globalId; i < numPixels; i += stride) {
-        unsigned char y_value = image[i * 3];
-
-        atomicAdd(&partial_histogram[y_value], 1);
-    }
-    __syncthreads();
-
-    // Merge partial histogram into global histogram
-    for (int i = threadId; i < 256; i += blockDim.x) {
-        atomicAdd(&histogram[i], partial_histogram[i]);
-    }
-}
-
 __global__ void computeHistogramKernelSimple(const unsigned char *image, int *histogram, int width, int height) {
     int globalId = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
@@ -106,54 +77,37 @@ __global__ void computeHistogramKernelSimple(const unsigned char *image, int *hi
 }
 
 
-__global__ void computeCumulativeHistogram(int *histogram, int *cdf) {
-   extern __shared__ int temp[256]; // 256 entries, 1 block
+__global__ void computeHistogramKernel(const unsigned char *image, int *histogram, int width, int height) {
 
-    int tid = threadIdx.x;
-
-    // Load input into shared memory
-    if (tid < 256) {
-        temp[tid] = histogram[tid];
+    __shared__ int shared_histogram[256];
+    
+    int threadId = threadIdx.x;
+    int globalId = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    int numPixels = width * height;
+    
+    // Initialize shared memory histogram to zeros
+    // Each thread initializes a portion of the histogram
+    for (int i = threadId; i < 256; i += blockDim.x) {
+        shared_histogram[i] = 0;
     }
+    
     __syncthreads();
-
-    // Upsweep
-    int offset = 1;
-    for (int d = 256 >> 1; d > 0; d >>= 1) {
-        __syncthreads();
-        if (tid < d) {
-            int ai = offset * (2 * tid + 1) - 1;
-            int bi = offset * (2 * tid + 2) - 1;
-            temp[bi] += temp[ai];
-        }
-        offset *= 2;
+    
+    // Each thread processes pixels with a stride pattern
+    for (int i = globalId; i < numPixels; i += stride) {
+        unsigned char y_value = image[i * 3];
+        atomicAdd(&shared_histogram[y_value], 1);
     }
-
-    // Set last element to 0 for exclusive scan
-    if (tid == 0) {
-        temp[255] = 0;
-    }
-
-    // Downsweep
-    for (int d = 1; d < 256; d *= 2) {
-        offset >>= 1;
-        __syncthreads();
-        if (tid < d) {
-            int ai = offset * (2 * tid + 1) - 1;
-            int bi = offset * (2 * tid + 2) - 1;
-
-            int t = temp[ai];
-            temp[ai] = temp[bi];
-            temp[bi] += t;
-        }
-    }
-
+    
+    // Wait for all threads in the block to finish updating shared histogram
     __syncthreads();
-
-    // Write result to output CDF (inclusive scan)
-    if (tid < 256) {
-        // For inclusive scan: add the original value to the exclusive scan result
-        cdf[tid] = temp[tid];
+    
+    // Merge partial histogram from shared memory to global histogram
+    for (int i = threadId; i < 256; i += blockDim.x) {
+        if (shared_histogram[i] > 0) { // Skip empty bins for efficiency
+            atomicAdd(&histogram[i], shared_histogram[i]);
+        }
     }
 }
 
@@ -164,6 +118,60 @@ __global__ void computeCumulativeHistogramSimple(const int *histogram, int *cdf)
             sum += histogram[i];
             cdf[i] = sum;
         }
+    }
+}
+
+__global__ void computeCumulativeHistogramAnother(const int *histogram, int *cdf) {
+    extern __shared__ int temp[];  // Dynamically allocated shared memory
+    
+    int tid = threadIdx.x;
+    
+    // Load input into shared memory
+    if (tid < 256) {
+        temp[tid] = histogram[tid];
+    }
+    __syncthreads();
+    
+    // Upsweep (reduction phase)
+    int offset = 1;
+    for (int d = 128; d > 0; d >>= 1) {  // Start from 256/2
+        __syncthreads();
+        if (tid < d) {
+            int ai = offset * (2 * tid + 1) - 1;
+            int bi = offset * (2 * tid + 2) - 1;
+            if (bi < 256) {  // don't access beyond array bounds
+                temp[bi] += temp[ai];
+            }
+        }
+        offset *= 2;
+    }
+    
+    // Set last element to 0 for exclusive scan
+    if (tid == 0) {
+        int t = temp[255];  // Save last element value
+        temp[255] = 0;      // Set to 0 for exclusive scan
+    }
+    __syncthreads();
+    
+    // Downsweep phase
+    for (int d = 1; d < 256; d *= 2) {
+        offset >>= 1;
+        __syncthreads();
+        if (tid < d) {
+            int ai = offset * (2 * tid + 1) - 1;
+            int bi = offset * (2 * tid + 2) - 1;
+            if (bi < 256) {  // Boundary check
+                int t = temp[ai];
+                temp[ai] = temp[bi];
+                temp[bi] += t;
+            }
+        }
+    }
+    __syncthreads();
+    
+    // Write result to output CDF with conversion to inclusive scan by adding the original histogram value
+    if (tid < 256) {
+        cdf[tid] = temp[tid] + histogram[tid];  // Convert exclusive to inclusive
     }
 }
 
@@ -296,7 +304,6 @@ void sequential(const unsigned char *image_in, unsigned char *image_out, int wid
         histogram_cumulative[i] = histogram_cumulative[i - 1] + histogram[i];
     }
 
-    // 4. Calculate new pixel luminances from original luminances based on the histogram equalization formula
     int luminance[256] = {0};
     int min_cumulative = INT_MAX;
 
@@ -344,7 +351,15 @@ void sequential(const unsigned char *image_in, unsigned char *image_out, int wid
     }
 }
 
-void parallel(unsigned char *image_in, unsigned char *image_out, int width, int height, int blockSizeInput) {
+struct KernelTimings {
+    float rgbToYuvTime;
+    float histogramTime;
+    float cdfTime;
+    float lookupTableTime;
+    float applyConvertTime;
+};
+
+KernelTimings parallel(unsigned char *image_in, unsigned char *image_out, int width, int height, int blockSizeInput, int histogramThreads) {
     cudaError_t error;
     int imageSize = width * height * 3 * sizeof(unsigned char);
 
@@ -352,22 +367,28 @@ void parallel(unsigned char *image_in, unsigned char *image_out, int width, int 
     dim3 blockSize(blockSizeInput, blockSizeInput);
     dim3 gridSize((width + blockSize.x - 1) / blockSize.x, (height + blockSize.y - 1) / blockSize.y);
 
-    int histogramThreads = 256;
     int histogramBlocks = min(16, (width * height + histogramThreads - 1) / histogramThreads);
+
+    // Kernel timings
+    float rgbToYuvTime = 0.0f;
+    float histogramTime = 0.0f;
+    float cdfTime = 0.0f;
+    float lookupTableTime = 0.0f;
+    float applyConvertTime = 0.0f;
 
     // Allocate device memory
     unsigned char *d_image_in, *d_image_out;
     error = cudaMalloc(&d_image_in, imageSize);
     if (error != cudaSuccess) {
         printf("Error allocating device memory for input image: %s\n", cudaGetErrorString(error));
-        return;
+        return {0, 0, 0, 0, 0}; // Return zeros on error
     }
 
     error = cudaMalloc(&d_image_out, imageSize);
     if (error != cudaSuccess) {
         printf("Error allocating device memory for output image: %s\n", cudaGetErrorString(error));
         cudaFree(d_image_in);
-        return;
+        return {0, 0, 0, 0, 0}; // Return zeros on error
     }
 
     // Copy input image to device
@@ -382,109 +403,70 @@ void parallel(unsigned char *image_in, unsigned char *image_out, int width, int 
     cudaMalloc(&d_histogram, 256 * sizeof(int));
     cudaMemset(d_histogram, 0, 256 * sizeof(int));
 
-    // Launch RGB to YUV conversion kernel
-    // Run once to warm up the GPU and not invalidate the measurement
+    // Benchmark
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+
+    // 1. Launch RGB to YUV conversion kernel
     rgbToYuvKernel<<<gridSize, blockSize>>>(d_image_in, d_image_out, width, height);
+    cudaDeviceSynchronize();
 
-    /*cudaEvent_t start, stop;
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
     float milliseconds = 0;
-    float total_milliseconds = 0;
-    int iterations = 10;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    rgbToYuvTime += milliseconds;
 
-    for (int i = 0; i < iterations; i++) {
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
-
-        cudaEventRecord(start);
-
-        rgbToYuvKernel<<<gridSize, blockSize>>>(d_image_in, d_image_out, width, height);
-
-        cudaEventRecord(stop);
-
-        cudaEventSynchronize(stop);
-
-        // Print time
-        cudaEventElapsedTime(&milliseconds, start, stop);
-        total_milliseconds += milliseconds;
-    }
-
-    printf("RGBtoYUV Block size %i, time: %0.3f milliseconds \n", blockSizeInput * blockSizeInput, total_milliseconds/iterations);
-    total_milliseconds = 0; */
-
-    // Check for kernel launch errors
-    error = cudaGetLastError();
-    if (error != cudaSuccess) {
-        printf("Error launching RGB to YUV kernel: %s\n", cudaGetErrorString(error));
-        cudaFree(image_in);
-        cudaFree(image_out);
-        return;
-    }
-
-    // Make sure kernel execution is finished
+    cudaEventRecord(start);
+    
+    computeHistogramKernel<<<histogramBlocks, histogramThreads>>>(d_image_out, d_histogram, width, height);
+    //computeHistogramKernelSimple<<<histogramBlocks, histogramThreads>>>(d_image_out, d_histogram, width, height);
     cudaDeviceSynchronize();
 
-    // TODO: Add the remaining steps of histogram equalization
-    // 1. Compute luminance histogram
-
-    /*for (int i = 0; i < iterations; i++) {
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
-
-        cudaEventRecord(start);
-
-        computeHistogramKernelSimple<<<histogramBlocks, histogramThreads>>>(d_image_out, d_histogram, width, height);
-        cudaDeviceSynchronize();
-
-        cudaEventRecord(stop);
-
-        cudaEventSynchronize(stop);
-
-        // Print time
-        cudaEventElapsedTime(&milliseconds, start, stop);
-        total_milliseconds += milliseconds;
-    }
-
-    printf("histogram Block size %i, time: %0.3f milliseconds \n", blockSizeInput * blockSizeInput, total_milliseconds/iterations);
-    total_milliseconds = 0; */
-
-
-    computeHistogramKernelSimple<<<histogramBlocks, histogramThreads>>>(d_image_out, d_histogram, width, height);
-    cudaDeviceSynchronize();
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    histogramTime += milliseconds;
 
     // 2. Calculate cumulative histogram (Bleloch scan)
-    //computeCumulativeHistogram<<<1, 256>>>(d_histogram, d_cdf);
-    computeCumulativeHistogramSimple<<<1, 1>>>(d_histogram, d_cdf);
+    cudaEventRecord(start);
+
+    computeCumulativeHistogramAnother<<<1, 256, 256 * sizeof(int)>>>(d_histogram, d_cdf);
     cudaDeviceSynchronize();
 
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    cdfTime += milliseconds;
+
     // 3. Calculate new pixel luminances
+    cudaEventRecord(start);
+
     calculateLuminanceLookupKernel<<<1, 256>>>(d_cdf, d_luminance_lookup_table, width * height);
     cudaDeviceSynchronize();
 
-    // 4. Apply new luminance to each pixel
-    // 5. Convert back from YUV to RGB
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    lookupTableTime += milliseconds;
 
-    /*for (int i = 0; i < iterations; i++) {
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
-
-        cudaEventRecord(start);
-
-        applyLuminanceAndConvertToRgbKernel<<<gridSize, blockSize>>>(d_image_out, d_luminance_lookup_table, width, height);
-        cudaDeviceSynchronize();
-
-        cudaEventRecord(stop);
-
-        cudaEventSynchronize(stop);
-
-        // Print time
-        cudaEventElapsedTime(&milliseconds, start, stop);
-        total_milliseconds += milliseconds;
-    }
-
-    printf("YUVtoRGB Block size %i, time: %0.3f milliseconds \n", blockSizeInput * blockSizeInput, total_milliseconds/iterations);*/
+    // 4. Apply new luminance to each pixel and convert back from YUV to RGB
+    cudaEventRecord(start);
 
     applyLuminanceAndConvertToRgbKernel<<<gridSize, blockSize>>>(d_image_out, d_luminance_lookup_table, width, height);
     cudaDeviceSynchronize();
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    applyConvertTime += milliseconds;
 
     // Copy result back to host
     error = cudaMemcpy(image_out, d_image_out, imageSize, cudaMemcpyDeviceToHost);
@@ -493,16 +475,34 @@ void parallel(unsigned char *image_in, unsigned char *image_out, int width, int 
     }
 
     // Free device memory
+    // Clean up timing events
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
     cudaFree(d_image_in);
     cudaFree(d_image_out);
     cudaFree(d_histogram);
     cudaFree(d_cdf);
     cudaFree(d_luminance_lookup_table);
+
+    return {rgbToYuvTime, histogramTime, cdfTime, lookupTableTime, applyConvertTime};
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 3) {
-        printf("USAGE: sample input_image output_image\n");
+    if (argc < 4) {
+        printf("USAGE: sample -seq|-par input_image output_image\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Check execution flag
+    bool runSequential = false;
+    bool runParallel = false;
+    
+    if (strcmp(argv[3], "-seq") == 0) {
+        runSequential = true;
+    } else if (strcmp(argv[3], "-par") == 0) {
+        runParallel = true;
+    } else {
+        printf("Invalid flag. Use -seq for sequential or -par for parallel execution.\n");
         exit(EXIT_FAILURE);
     }
 
@@ -524,61 +524,161 @@ int main(int argc, char *argv[]) {
     const size_t datasize = width * height * cpp * sizeof(unsigned char);
     unsigned char *h_imageOut = (unsigned char *)malloc(datasize);
 
-    /*clock_t begin, end;
-    float elapsed_ms;
+    if (runSequential) {
+        clock_t begin, end;
+        float elapsed_ms;
 
-    begin = clock();
+        begin = clock();
 
-    sequential(h_imageIn, h_imageOut, width, height);
+        sequential(h_imageIn, h_imageOut, width, height);
 
-    end = clock();
-    elapsed_ms = ((float)(end - begin) / CLOCKS_PER_SEC) * 1000.0;
+        end = clock();
+        elapsed_ms = ((float)(end - begin) / CLOCKS_PER_SEC) * 1000.0;
 
-    printf("Sequential method time: %.3f milliseconds\n", elapsed_ms);
-    */
+        printf("Sequential method time: %.3f milliseconds\n", elapsed_ms);
+    }
 
+    
     // Setup Thread organization
     //dim3 blockSize(16, 16);
     //dim3 gridSize((height-1)/blockSize.x+1,(width-1)/blockSize.y+1);
     //dim3 gridSize(1, 1);
 
-    unsigned char *d_imageIn;
-    unsigned char *d_imageOut;
+    
 
-    // Allocate memory on the device
-    checkCudaErrors(cudaMalloc(&d_imageIn, datasize));
-    checkCudaErrors(cudaMalloc(&d_imageOut, datasize));
+    if (runParallel) {
 
-    // Parallel CUDA implementation
-    printf("Parallel execution time\n");
+        // For storing best configurations
+        typedef struct {
+            int blockSize;
+            int histogramThreads;
+            float bestTime;
+        } OptimalConfig;
 
-    cudaEvent_t start, stop;
-    float milliseconds = 0;
-    float total_milliseconds = 0;
-    int iterations = 100;
+        // Parallel CUDA implementation
+        printf("[BENCHMARK] Parallel execution time\n");
 
-    for (int block = 8; block <= 32; block *= 2) {
-        printf("Block size %i\n", block * block);
-        for (int i = 0; i < iterations; i++) {
-            cudaEventCreate(&start);
-            cudaEventCreate(&stop);
-
-            cudaEventRecord(start);
-
-            parallel(h_imageIn, h_imageOut, width, height, block);
-
-            cudaEventRecord(stop);
-            cudaEventSynchronize(stop);
-
-            // Print time
-            cudaEventElapsedTime(&milliseconds, start, stop);
-            total_milliseconds += milliseconds;
+        OptimalConfig bestConfigs[5]; // One for each image size
+        for (int i = 0; i < 5; i++) {
+            bestConfigs[i].bestTime = FLT_MAX;
         }
 
-        printf("Block size %i, time: %0.3f milliseconds \n", block * block, total_milliseconds/iterations);
-        total_milliseconds = 0;
-    }
+        // Define histogram thread counts to test (powers of 2)
+        int histogramThreads[] = {128, 256, 512, 1024};
+        int numHistogramThreads = sizeof(histogramThreads) / sizeof(histogramThreads[0]);
 
+        cudaEvent_t start, stop;
+        float milliseconds = 0;
+        float total_milliseconds = 0;
+        int iterations = 100;
+
+        for (int block = 8; block <= 32; block *= 2) {
+
+            for (int t = 0; t < numHistogramThreads; t++) {
+
+                int histogramThread = histogramThreads[t];
+                //printf("Block size %i, Threads: %i\n", block * block, histogramThread);
+
+                float total_rgbToYuvTime = 0.0f;
+                float total_histogramTime = 0.0f;
+                float total_cdfTime = 0.0f;
+                float total_lookupTableTime = 0.0f;
+                float total_applyConvertTime = 0.0f;
+
+                for (int i = 0; i < iterations; i++) {
+                    cudaEventCreate(&start);
+                    cudaEventCreate(&stop);
+
+                    cudaEventRecord(start);
+
+                    KernelTimings timings = parallel(h_imageIn, h_imageOut, width, height, block, histogramThread);
+
+                    total_rgbToYuvTime += timings.rgbToYuvTime;
+                    total_histogramTime += timings.histogramTime;
+                    total_cdfTime += timings.cdfTime;
+                    total_lookupTableTime += timings.lookupTableTime;
+                    total_applyConvertTime += timings.applyConvertTime;
+
+                    cudaEventRecord(stop);
+                    cudaEventSynchronize(stop);
+
+                    // Print time
+                    cudaEventElapsedTime(&milliseconds, start, stop);
+                    total_milliseconds += milliseconds;
+                }
+
+                float avgRgbToYuv = total_rgbToYuvTime / iterations;
+                float avgHistogram = total_histogramTime / iterations;
+                float avgCdf = total_cdfTime / iterations;
+                float avgLookup = total_lookupTableTime / iterations;
+                float avgApply = total_applyConvertTime / iterations;
+                float avgTotal = total_milliseconds / iterations;
+                
+                // For each kernel, determine if we need to update with best time
+                if (avgRgbToYuv < bestConfigs[0].bestTime) {
+                    bestConfigs[0].bestTime = avgRgbToYuv;
+                    bestConfigs[0].blockSize = block * block;
+                    bestConfigs[0].histogramThreads = histogramThread;
+                }
+                
+                if (avgHistogram < bestConfigs[1].bestTime) {
+                    bestConfigs[1].bestTime = avgHistogram;
+                    bestConfigs[1].blockSize = block * block;
+                    bestConfigs[1].histogramThreads = histogramThread;
+                }
+                
+                if (avgCdf < bestConfigs[2].bestTime) {
+                    bestConfigs[2].bestTime = avgCdf;
+                    bestConfigs[2].blockSize = block * block;
+                    bestConfigs[2].histogramThreads = histogramThread;
+                }
+                
+                if (avgLookup < bestConfigs[3].bestTime) {
+                    bestConfigs[3].bestTime = avgLookup;
+                    bestConfigs[3].blockSize = block * block;
+                    bestConfigs[3].histogramThreads = histogramThread;
+                }
+                
+                if (avgApply < bestConfigs[4].bestTime) {
+                    bestConfigs[4].bestTime = avgApply;
+                    bestConfigs[4].blockSize = block * block;
+                    bestConfigs[4].histogramThreads = histogramThread;
+                }
+
+                //printf("Kernel 1: RGB to YUV conversion       - Avg time: %.3f ms\n", total_rgbToYuvTime / iterations);
+                //printf("Kernel 2: Histogram Computation       - Avg time: %.3f ms\n", total_histogramTime / iterations);
+                //printf("Kernel 3: Cumulative Histogram        - Avg time: %.3f ms\n", total_cdfTime / iterations);
+                //printf("Kernel 4: Luminance Lookup Table      - Avg time: %.3f ms\n", total_lookupTableTime / iterations);
+                //printf("Kernel 5: Apply Luminance & RGB conv  - Avg time: %.3f ms\n", total_applyConvertTime / iterations);
+                printf("[Block size %i, Threads %i] Total time: %.3f milliseconds\n", block * block, histogramThread, avgTotal);
+                printf("--------------------------------------------------------------------------------\n");
+
+                total_milliseconds = 0;
+            }
+        }
+
+        const char* kernelNames[5] = {
+            "RGB to YUV Conversion",
+            "Histogram Computation",
+            "Cumulative Histogram (CDF)",
+            "Luminance Lookup Table",
+            "Apply Luminance & Convert to RGB"
+        };
+    
+        printf("\n========== BEST CONFIGURATIONS PER KERNEL ==========\n");
+        for (int i = 0; i < 5; i++) {
+            printf("Kernel %d (%s):\n", i + 1, kernelNames[i]);
+            printf("  Best Time: %.3f ms\n", bestConfigs[i].bestTime);
+            printf("  Block Size: %d\n", bestConfigs[i].blockSize);
+            printf("  Histogram Threads: %d\n", bestConfigs[i].histogramThreads);
+            printf("------------------------------------------------------\n");
+        }
+
+        // Clean-up events
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+    }
+    
     // Write the output file
     char szImage_out_name_temp[255];
     strncpy(szImage_out_name_temp, szImage_out_name, 255);
@@ -601,10 +701,6 @@ int main(int argc, char *argv[]) {
     // Free device memory
     //checkCudaErrors(cudaFree(d_imageIn));
     //checkCudaErrors(cudaFree(d_imageOut));
-
-    // Clean-up events
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
 
     // Free host memory
     free(h_imageIn);
